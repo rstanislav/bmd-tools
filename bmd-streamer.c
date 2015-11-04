@@ -7,16 +7,21 @@
  */
 
 #include <math.h>
+#include <errno.h>
+#include <spawn.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <signal.h>
 #include <string.h>
+#include <syslog.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 
 #include <libusb.h>
@@ -25,14 +30,9 @@
 
 /*
  * TODO and ideas:
- * - AIN_OFFSET, VR_SET_AUDIO_DELAY: test
- * - Handle resolution changes properly
+ * - Get VR_SET_AUDIO_DELAY for remaining modes from USB traces
  * - Selecting capture target format - now it's "Native (Progressive)"
- * - Per-device configuration to allow sending multiple streams to
- *   different sockets
- * - Consider rewriting the threaded implementation to state machines
- *   and asynchronous USB library usage. This would remove the few long
- *   timeouts while ending playback.
+ * - Make the capture thread cancellable
  */
 
 #define array_size(x) (sizeof(x) / sizeof(x[0]))
@@ -41,10 +41,13 @@ struct encoding_parameters {
 	uint16_t	video_kbps, video_max_kbps, audio_kbps, audio_khz;
 	uint8_t		h264_profile, h264_level, h264_bframes, h264_cabac, fps_divider;
 	int8_t		input_source;
+	char *		exec_program;
+	int		respawn : 1;
 };
 
+static int do_syslog = 0;
+static int loglevel = LOG_NOTICE;
 static int firmware_fd = AT_FDCWD;
-static int verbose = 0;
 static int running = 1;
 static volatile int num_workers = 0;
 static struct encoding_parameters ep = {
@@ -61,16 +64,16 @@ static struct encoding_parameters ep = {
 };
 
 static const char *input_source_names[5] = {
-	[0] = "0", /* s-video or component */
+	[INPUT_COMPONENT] = "component",
 	[INPUT_HDMI] = "hdmi",
 	[INPUT_SDI] = "sdi",
 	[INPUT_COMPOSITE] = "composite",
-	[4] = "4", /* s-video or component */
+	[INPUT_SVIDEO] = "s-video",
 };
 
 enum DISPLAY_MODE {
 	DMODE_720x480i_29_97 = 0,
-	DMODE_720x576i_30,
+	DMODE_720x576i_25,
 	DMODE_invalid,
 	DMODE_720x480p_59_94,
 	DMODE_720x576p_50,
@@ -97,22 +100,55 @@ struct display_mode {
 	int		fps_numerator, fps_denominator;
 
 	uint8_t		interlaced : 1;
+	uint8_t		program_fpga : 1;
 	uint8_t		convert_to_1088 : 1;
 	uint8_t		fx2_fps;
-
+	uint8_t		audio_delay;
 	uint16_t	ain_offset;
 	uint16_t	r1000, r1404, r140a, r1430_l;
 	uint16_t	r147x[4];
-	uint16_t	r154x[10];
+	uint16_t	r154x[11];
 };
 
 static struct display_mode *display_modes[DMODE_MAX] = {
-	/* DMODE_720x480i_29_97 */
-	/* DMODE_720x576i_30 */
+	[DMODE_720x480i_29_97] = &(struct display_mode){
+		.description = "480i 29.97",
+		.width = 720, .height = 486, .interlaced = 1, .program_fpga = 1,
+		.fps_numerator = 30000, .fps_denominator = 1001, .fx2_fps = 0x4,
+		.audio_delay = 0x27, .ain_offset = 0x0000,
+		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x1050, 0x0002, 0x07ff, 0x035a, 0x020d, 0x008a, 0x002c, 0x07ff, 0x02d0, 0x01e8, 0x001e },
+	},
+	[DMODE_720x576i_25] = &(struct display_mode){
+		.description = "576i 25",
+		.width = 720, .height = 576, .interlaced = 1, .program_fpga = 1,
+		.fps_numerator = 25, .fps_denominator = 1, .fx2_fps = 0x3,
+		.audio_delay = 0x30, .ain_offset = 0x0000,
+		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x1050, 0x0000, 0x07ff, 0x0360, 0x0271, 0x0090, 0x002e, 0x07ff, 0x02d0, 0x0240, 0x0019 },
+	},
 	/* DMODE_720x480p_59_94 */
 	/* DMODE_720x576p_50 */
-	/* DMODE_1920x1080p_23_976 */
-	/* DMODE_1920x1080p_24 */
+	[DMODE_1920x1080p_23_976] = &(struct display_mode){
+		.description = "1080p 23.97",
+		.width = 1920, .height = 1080,
+		.fps_numerator = 24000, .fps_denominator = 1001, .fx2_fps = 0x1,
+		.ain_offset = 0x0177,
+		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0abe, 0x0465, 0x033e, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0018 },
+	},
+	[DMODE_1920x1080p_24] = &(struct display_mode){
+		.description = "1080p 24",
+		.width = 1920, .height = 1080,
+		.fps_numerator = 24, .fps_denominator = 1, .fx2_fps = 0x2,
+		.ain_offset = 0x0000,
+		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0abe, 0x0465, 0x033e, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0018 },
+	},
 	[DMODE_1920x1080p_25] = &(struct display_mode){
 		.description = "1080p 25",
 		.width = 1920, .height = 1080,
@@ -120,7 +156,7 @@ static struct display_mode *display_modes[DMODE_MAX] = {
 		.ain_offset = 0x0708,
 		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
 		.r147x = { 0x26, 0x7d, 0x56, 0x07 },
-		.r154x = { 0x0001, 0x07ff, 0x0abd, 0x0465, 0x00c3, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0019 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0abd, 0x0465, 0x00c3, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0019 },
 	},
 	/* DMODE_1920x1080p_29_97 */
 	[DMODE_1920x1080p_30] = &(struct display_mode){
@@ -130,7 +166,7 @@ static struct display_mode *display_modes[DMODE_MAX] = {
 		.ain_offset = 0x0a8c,
 		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
 		.r147x = { 0x26, 0x7d, 0x56, 0x07 },
-		.r154x = { 0x0001, 0x07ff, 0x0897, 0x0465, 0x00c5, 0x0015, 0x07ff, 0x0780, 0x0438, 0x001e },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0897, 0x0465, 0x00c5, 0x0015, 0x07ff, 0x0780, 0x0438, 0x001e },
 	},
 	[DMODE_1920x1080i_25] = &(struct display_mode){
 		.description = "1080i 50",
@@ -139,7 +175,7 @@ static struct display_mode *display_modes[DMODE_MAX] = {
 		.ain_offset = 0x0000,
 		.r1000 = 0x0200, .r1404 = 0x0041, .r140a = 0x1701, .r1430_l = 0xff,
 		.r147x = { 0x26, 0x7d, 0x56, 0x07 },
-		.r154x = { 0x0034, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x000e, 0x0780, 0x0438, 0x0000 },
+		.r154x = { 0x0000, 0x0034, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x000e, 0x0780, 0x0438, 0x0000 },
 	},
 	[DMODE_1920x1080i_29_97] = &(struct display_mode){
 		.description = "1080i 29.97",
@@ -148,11 +184,35 @@ static struct display_mode *display_modes[DMODE_MAX] = {
 		.ain_offset = 0x0000,
 		.r1000 = 0x0200, .r1404 = 0x0071, .r140a = 0x1700, .r1430_l = 0xff,
 		.r147x = { 0x26, 0x7d, 0x56, 0x07 },
-		.r154x = { 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x000e, 0x0000, 0x0400, 0x0000 },
+		.r154x = { 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x000e, 0x0000, 0x0400, 0x0000 },
 	},
-	/* DMODE_1920x1080i_30 */
-	/* DMODE_1920x1080p_50 */
-	/* DMODE_1920x1080p_59_94 */
+	[DMODE_1920x1080i_30] = &(struct display_mode){
+		.description = "1080i 30",
+		.width = 1920, .height = 1080, .interlaced = 1, .convert_to_1088 = 1, .program_fpga = 1,
+		.fps_numerator = 30, .fps_denominator = 1, .fx2_fps = 0x5,
+		.ain_offset = 0x0000,
+		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0898, 0x0465, 0x0118, 0x0015, 0x07ff, 0x0780, 0x0438, 0x001e },
+	},
+	[DMODE_1920x1080p_50] = &(struct display_mode){
+		.description = "1080p 50",
+		.width = 1920, .height = 1080, .interlaced = 0,
+		.fps_numerator = 50, .fps_denominator = 1, .fx2_fps = 0x6,
+		.ain_offset = 0x05a0,
+		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0a50, 0x0465, 0x02d0, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0032 },
+	},
+	[DMODE_1920x1080p_59_94] = &(struct display_mode){
+		.description = "1080p 59.94",
+		.width = 1920, .height = 1080, .interlaced = 0,
+		.fps_numerator = 60000, .fps_denominator = 1001, .fx2_fps = 0x7,
+		.ain_offset = 0x0000,
+		.r1000 = 0x0200, .r1404 = 0x0071, .r140a = 0x151e, .r1430_l = 0x02,
+		.r147x = { 0x10, 0x70, 0x70, 0x10 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0898, 0x0465, 0x0118, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0000 },
+	},
 	[DMODE_1920x1080p_60] = &(struct display_mode){
 		.description = "1080p 60",
 		.width = 1920, .height = 1080, .interlaced = 0,
@@ -160,34 +220,34 @@ static struct display_mode *display_modes[DMODE_MAX] = {
 		.ain_offset = 0x079e,
 		.r1000 = 0x0200, .r1404 = 0x0071, .r140a = 0x151e, .r1430_l = 0x02,
 		.r147x = { 0x26, 0x7d, 0x56, 0x07 },
-		.r154x = { 0x0001, 0x07ff, 0x0897, 0x0465, 0x00c5, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0000 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0897, 0x0465, 0x00c5, 0x0015, 0x07ff, 0x0780, 0x0438, 0x0000 },
 	},
 	[DMODE_1280x720p_50] = &(struct display_mode){
 		.description = "720p 50",
 		.width = 1280, .height = 720, .interlaced = 0,
 		.fps_numerator = 50, .fps_denominator = 1, .fx2_fps = 0x6,
-		.ain_offset = 0x0384,
+		.audio_delay = 0x05, .ain_offset = 0x0384,
 		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
 		.r147x = { 0x10, 0x70, 0x70, 0x10 },
-		.r154x = { 0x0001, 0x07ff, 0x07bb, 0x02ee, 0x0107, 0x001a, 0x07ff, 0x0500, 0x02d0, 0x0032 },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x07bb, 0x02ee, 0x0107, 0x001a, 0x07ff, 0x0500, 0x02d0, 0x0032 },
 	},
 	[DMODE_1280x720p_59_94] = &(struct display_mode){
 		.description = "720p 59.94",
 		.width = 1280, .height = 720, .interlaced = 0,
 		.fps_numerator = 60000, .fps_denominator = 1001, .fx2_fps = 0x7,
-		.ain_offset = 0x0384,
+		.audio_delay = 0x07, .ain_offset = 0x0384,
 		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
 		.r147x = { 0x10, 0x70, 0x70, 0x10 },
-		.r154x = { 0x0001, 0x07ff, 0x07bb, 0x02ee, 0x0107, 0x001a, 0x07ff, 0x0500, 0x02d0, 0x003c },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x07bb, 0x02ee, 0x0107, 0x001a, 0x07ff, 0x0500, 0x02d0, 0x003c },
 	},
 	[DMODE_1280x720p_60] = &(struct display_mode){
 		.description = "720p 60",
 		.width = 1280, .height = 720,
 		.fps_numerator = 60, .fps_denominator = 1, .fx2_fps = 0x8,
-		.ain_offset = 0x02ee,
+		.audio_delay = 0x06, .ain_offset = 0x02ee,
 		.r1000 = 0x0500, .r1404 = 0x0071, .r140a = 0x17ff, .r1430_l = 0xff,
 		.r147x = { 0x10, 0x70, 0x70, 0x10 },
-		.r154x = { 0x0001, 0x07ff, 0x0671, 0x02ee, 0x010b, 0x001a, 0x07ff, 0x0500, 0x02d0, 0x003c },
+		.r154x = { 0x0000, 0x0001, 0x07ff, 0x0671, 0x02ee, 0x010b, 0x001a, 0x07ff, 0x0500, 0x02d0, 0x003c },
 	},
 };
 
@@ -236,7 +296,7 @@ static int input_mode_to_display_mode(uint8_t mode)
 
 	switch (mode) {
 	case 0x00: return DMODE_720x480i_29_97;
-	case 0x20: return DMODE_720x576i_30;
+	case 0x20: return DMODE_720x576i_25;
 	case 0x40: return DMODE_720x480p_59_94;
 	case 0x60: return DMODE_720x576p_50;
 	case 0x80: return DMODE_1920x1080i_30;
@@ -257,6 +317,32 @@ static int input_mode_to_display_mode(uint8_t mode)
 	}
 }
 
+static void hexdump(char *buf, size_t buflen, const char *ptr, size_t ptrlen)
+{
+	int i;
+
+	for (i = 0; i < ptrlen && (i+1)*2+1 <= buflen; i++)
+		snprintf(&buf[i*2], 3, "%02x", (unsigned char) ptr[i]);
+}
+
+static void dlog(int prio, const char *format, ...)
+{
+	va_list va;
+
+	if (prio > loglevel) return;
+
+	va_start(va, format);
+	if (do_syslog)
+		vsyslog(prio, format, va);
+	else {
+		flockfile(stderr);
+		vfprintf(stderr, format, va);
+		fputc('\n', stderr);
+		funlockfile(stderr);
+	}
+	va_end(va);
+}
+
 struct firmware {
 	uint32_t	size;
 	uint16_t	device_id;
@@ -273,7 +359,7 @@ static struct firmware *load_firmware(const char *filename, uint16_t device_id)
 
 	r = fstatat(firmware_fd, filename, &st, 0);
 	if (r != 0) {
-		fprintf(stderr, "%s: failed to load firmware to memory\n", filename);
+		dlog(LOG_ERR, "%s: failed to load firmware to memory", filename);
 		return NULL;
 	}
 
@@ -298,36 +384,62 @@ error:
 }
 
 struct mpeg_parser_buffer {
+	int output_fd;
 	int oldlen;
 	unsigned char olddata[0xbc];
 	unsigned char data[16*1024];
 };
 
-static void mpegparser_parse(struct mpeg_parser_buffer *pb, int newlen)
+static int mpegparser_parse(struct mpeg_parser_buffer *pb, int newlen)
 {
+	struct iovec iov[64];
 	unsigned char *buf = &pb->data[-pb->oldlen];
-	int i = 0, len = newlen + pb->oldlen;
+	int i = 0, len = newlen + pb->oldlen, r = 0, ioc = 0, nomerge = 1;
 
 	while (i + 0xbc <= len) {
-		if (memcmp(&buf[i], "\x00\x00\x00\x00", 4) == 0) {
-			i += 0xbc;
-			continue;
-		}
+		if (memcmp(&buf[i], "\x00\x00\x00\x00", 4) == 0) goto skip_block;
 		if (buf[i] != 0x47) {
 			while (buf[i] != 0x47 && i < len)
 				i++;
-			continue;
+			goto skip;
 		}
-		if (buf[i+1] == 0x1f && buf[i+2] == 0xff) {
+		if (buf[i+1] == 0x1f && buf[i+2] == 0xff) goto skip_block;
+		if (pb->output_fd < 0 || r) {
+		skip_block:
 			i += 0xbc;
+		skip:
+			nomerge = 1;
 			continue;
 		}
-		write(STDOUT_FILENO, &buf[i], 0xbc);
+
+		if (nomerge) {
+			nomerge = 0;
+			iov[ioc].iov_base = &buf[i];
+			iov[ioc].iov_len = 0xbc;
+			if (++ioc >= array_size(iov)) {
+				if (writev(pb->output_fd, iov, ioc) < 0) {
+					dlog(LOG_NOTICE, "error writing MPEG TS: %s",
+						strerror(errno));
+					if (errno == EPIPE) r = -1;
+				}
+				ioc = 0;
+				nomerge = 1;
+			}
+		} else {
+			iov[ioc-1].iov_len += 0xbc;
+		}
 		i += 0xbc;
+	}
+
+	if (ioc && writev(pb->output_fd, iov, ioc) < 0) {
+		dlog(LOG_NOTICE, "error writing MPEG TS: %s",
+			strerror(errno));
+		if (errno == EPIPE) r = -1;
 	}
 
 	pb->oldlen = len - i;
 	memcpy(&pb->data[-pb->oldlen], &buf[i], pb->oldlen);
+	return r;
 }
 
 struct blackmagic_device {
@@ -336,8 +448,9 @@ struct blackmagic_device {
 	volatile int running;
 	int status;
 	int fxstatus;
-	int recognized;
-	int encode_sent;
+	int recognized : 1;
+	int encode_sent : 1;
+	int display_mode_changed : 1;
 
 	int current_display_mode;
 	struct display_mode *current_mode;
@@ -352,6 +465,13 @@ struct blackmagic_device {
 	struct mpeg_parser_buffer mpegparser;
 };
 
+static void reapchildren(int sig)
+{
+	int status;
+
+	while (waitpid(-1, &status, WNOHANG) == 0 || errno == EINTR);
+}
+
 static void dostop(int sig)
 {
 	running = 0;
@@ -362,6 +482,8 @@ static void bmd_set_input_source(struct blackmagic_device *bmd, uint8_t mode)
 	int r;
 	if (bmd->status != LIBUSB_SUCCESS)
 		return;
+	dlog(LOG_NOTICE, "%s: switching input source to %s (%d)",
+		bmd->name, input_source_names[mode], mode);
 	r = libusb_control_transfer(
 		bmd->usbdev_handle, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR,
 		VR_SET_INPUT_SOURCE, 0x0000, 0, &mode, 1, 1000);
@@ -425,10 +547,11 @@ static void bmd_fujitsu_write(struct blackmagic_device *bmd, uint32_t reg, uint1
 	msg[3] = value >> 8;
 	msg[4] = value;
 
-	if (verbose >= 2) {
+	if (loglevel >= LOG_DEBUG) {
 		uint16_t oldvalue = bmd_fujitsu_read(bmd, reg);
 		if (value != oldvalue)
-			fprintf(stderr, "%s: fujitsu_write @%06x %04x != %04x\n", bmd->name, reg, value, oldvalue);
+			dlog(LOG_DEBUG, "%s: fujitsu_write @%06x %04x != %04x",
+				bmd->name, reg, value, oldvalue);
 	}
 
 	r = libusb_control_transfer(
@@ -459,6 +582,63 @@ static int bmd_upload_firmware(struct blackmagic_device *bmd, struct firmware *f
 	return bmd->status == LIBUSB_SUCCESS;
 }
 
+static int bmd_start_exec_program(struct blackmagic_device *bmd, char *exec_program)
+{
+	char tmp[1024];
+	char *envp[16];
+	char *argv[] = { exec_program, 0 };
+	int r, i, p, pipefd[2];
+	posix_spawn_file_actions_t fa;
+
+	if (!exec_program) {
+		bmd->mpegparser.output_fd = STDOUT_FILENO;
+		return 1;
+	}
+
+	dlog(LOG_DEBUG, "%s: launching exec program: %s", bmd->name, ep.exec_program);
+
+	if (pipe(pipefd) < 0)
+		return 0;
+
+	i = p = 0;
+	if (bmd->desc.idProduct != USB_PID_BMD_H264_PRO_RECORDER) {
+		envp[i++] = &tmp[p];
+		p += snprintf(&tmp[p], sizeof(tmp)-p, "BMD_MAC=%02x%02x%02x%02x%02x%02x",
+			bmd->mac[0], bmd->mac[1], bmd->mac[2], bmd->mac[3], bmd->mac[4], bmd->mac[5]) + 1;
+	}
+	envp[i++] = &tmp[p];
+	p += snprintf(&tmp[p], sizeof(tmp)-p, "BMD_STREAM_WIDTH=%d", bmd->current_mode->width) + 1;
+	envp[i++] = &tmp[p];
+	p += snprintf(&tmp[p], sizeof(tmp)-p, "BMD_STREAM_HEIGHT=%d", bmd->current_mode->height) + 1;
+	envp[i] = 0;
+
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, pipefd[0], STDIN_FILENO);
+	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+	r = posix_spawnp(NULL, argv[0], &fa, NULL, argv, envp);
+	posix_spawn_file_actions_destroy(&fa);
+
+	close(pipefd[0]);
+	if (r != 0) {
+		close(pipefd[1]);
+		return 0;
+	}
+
+	bmd->mpegparser.output_fd = pipefd[1];
+	fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
+	return 1;
+}
+
+static void bmd_kill_exec_program(struct blackmagic_device *bmd)
+{
+	if (ep.exec_program && bmd->mpegparser.output_fd >= 0) {
+		dlog(LOG_DEBUG, "%s: closing output stream", bmd->name);
+		close(bmd->mpegparser.output_fd);
+	}
+	bmd->mpegparser.output_fd = -1;
+}
+
+
 static void *bmd_pump_mpegts(void *ctx)
 {
 	struct blackmagic_device *bmd = ctx;
@@ -471,11 +651,23 @@ static void *bmd_pump_mpegts(void *ctx)
 			&actual_length, 5000);
 		if (r != LIBUSB_SUCCESS && r != LIBUSB_ERROR_TIMEOUT)
 			break;
+		if (r == LIBUSB_ERROR_TIMEOUT)
+			dlog(LOG_INFO, "%s: mpeg-ts pump: timeout reading data, retrying!", bmd->name);
 
-		mpegparser_parse(&bmd->mpegparser, actual_length);
+		if (mpegparser_parse(&bmd->mpegparser, actual_length) < 0) {
+			if (ep.exec_program) {
+				if (ep.respawn) {
+					bmd_kill_exec_program(bmd);
+					bmd_start_exec_program(bmd, ep.exec_program);
+				} else {
+					bmd->running = 0;
+				}
+			} else
+				running = 0;
+		}
 	} while (running && bmd->running);
 
-	if (verbose) fprintf(stderr, "%s: mpeg-ts pump exiting: %s\n", bmd->name, libusb_error_name(r));
+	dlog(LOG_DEBUG, "%s: mpeg-ts pump exiting: %s", bmd->name, libusb_error_name(r));
 
 	return NULL;
 }
@@ -503,7 +695,7 @@ static int bmd_recognize_device(struct blackmagic_device *bmd)
 	for (i = 0; i < 6; i++)
 		bmd_read_register(bmd, 0x88 + i, &bmd->mac[i]);
 
-	fprintf(stderr, "%s: MAC address %02x:%02x:%02x:%02x:%02x:%02x\n",
+	dlog(LOG_NOTICE, "%s: MAC address %02x:%02x:%02x:%02x:%02x:%02x",
 		bmd->name,
 		bmd->mac[0], bmd->mac[1], bmd->mac[2],
 		bmd->mac[3], bmd->mac[4], bmd->mac[5]);
@@ -513,6 +705,8 @@ static int bmd_recognize_device(struct blackmagic_device *bmd)
 
 static int bmd_configure_encoder(struct blackmagic_device *bmd, struct encoding_parameters *ep)
 {
+	uint8_t fpga_command_1[1] = { 0x20 };
+	uint8_t fpga_command_2[1] = { 0x40 };
 	struct display_mode *current_mode = bmd->current_mode;
 	uint32_t total_bandwidth;
 	float fps;
@@ -527,8 +721,25 @@ static int bmd_configure_encoder(struct blackmagic_device *bmd, struct encoding_
 	total_bandwidth += 1.021739130434783 * (ceil(1464*fps) + ceil(152*fps) + (ep->video_max_kbps + 1000) * 1000);
 
 	r = libusb_control_transfer(
+		bmd->usbdev_handle, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR,
+		current_mode->program_fpga ? VR_SEND_FPGA_COMMAND : VR_CLEAR_FPGA_COMMAND, 0, 0,
+		fpga_command_1, sizeof(fpga_command_1), 1000);
+	if (r < 0) {
+		bmd->status = r;
+		return 0;
+	}
+	r = libusb_control_transfer(
+		bmd->usbdev_handle, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR,
+		VR_CLEAR_FPGA_COMMAND, 0, 0,
+		fpga_command_2, sizeof(fpga_command_2), 1000);
+	if (r < 0) {
+		bmd->status = r;
+		return 0;
+	}
+
+	r = libusb_control_transfer(
 		bmd->usbdev_handle, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR,  
-		VR_SET_AUDIO_DELAY, 0, 0, "\x00", 1, 5000);
+		VR_SET_AUDIO_DELAY, 0, 0, &current_mode->audio_delay, 1, 5000);
 	if (r < 0) {
 		bmd->status = r;
 		return 0;
@@ -599,22 +810,21 @@ static int bmd_configure_encoder(struct blackmagic_device *bmd, struct encoding_
 	bmd_fujitsu_write(bmd, 0x00147a, 0x0000);
 	bmd_fujitsu_write(bmd, 0x00147c, 0x0000);
 	bmd_fujitsu_write(bmd, 0x00147e, 0x0000);
-	/* 0x001540 depends on if PAL/NTSC or interlaced mode is set */
-	bmd_fujitsu_write(bmd, 0x001540, 0x0000);
 
 	/* INPUT MODE based constants likely tuning for sync or similar,
 	 * some of these seem to get ignored (and initialized to random
 	 * value by the BMD drivers). */
-	bmd_fujitsu_write(bmd, 0x001542, current_mode->r154x[0]);
-	bmd_fujitsu_write(bmd, 0x001544, current_mode->r154x[1]);
-	bmd_fujitsu_write(bmd, 0x001546, current_mode->r154x[2]);
-	bmd_fujitsu_write(bmd, 0x001548, current_mode->r154x[3]);
-	bmd_fujitsu_write(bmd, 0x00154a, current_mode->r154x[4]);
-	bmd_fujitsu_write(bmd, 0x00154c, current_mode->r154x[5]);
-	bmd_fujitsu_write(bmd, 0x00154e, current_mode->r154x[6]);
-	bmd_fujitsu_write(bmd, 0x001550, current_mode->r154x[7]);
-	bmd_fujitsu_write(bmd, 0x001552, current_mode->r154x[8]);
-	bmd_fujitsu_write(bmd, 0x001554, current_mode->r154x[9]);
+	bmd_fujitsu_write(bmd, 0x001540, current_mode->r154x[0]);
+	bmd_fujitsu_write(bmd, 0x001542, current_mode->r154x[1]);
+	bmd_fujitsu_write(bmd, 0x001544, current_mode->r154x[2]);
+	bmd_fujitsu_write(bmd, 0x001546, current_mode->r154x[3]);
+	bmd_fujitsu_write(bmd, 0x001548, current_mode->r154x[4]);
+	bmd_fujitsu_write(bmd, 0x00154a, current_mode->r154x[5]);
+	bmd_fujitsu_write(bmd, 0x00154c, current_mode->r154x[6]);
+	bmd_fujitsu_write(bmd, 0x00154e, current_mode->r154x[7]);
+	bmd_fujitsu_write(bmd, 0x001550, current_mode->r154x[8]);
+	bmd_fujitsu_write(bmd, 0x001552, current_mode->r154x[9]);
+	bmd_fujitsu_write(bmd, 0x001554, current_mode->r154x[10]);
 
 	/* Group 4 - Audio encoder */
 	switch (ep->audio_khz) {
@@ -708,7 +918,7 @@ static void bmd_encoder_dump(struct blackmagic_device *bmd)
 		".ain_offset = 0x%04x,\n"
 		".r1000 = 0x%04x, .r1404 = 0x%04x, .r140a = 0x%04x, .r1430_l = 0x%02x,\n"
 		".r147x = { 0x%02x, 0x%02x, 0x%02x, 0x%02x },\n"
-		".r154x = { 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x },\n"
+		".r154x = { 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x, 0x%04x },\n"
 		"-------------------------------------------------------\n",
 		bmd->current_display_mode,
 
@@ -728,6 +938,7 @@ static void bmd_encoder_dump(struct blackmagic_device *bmd)
 		bmd_fujitsu_read(bmd, 0x001474),
 		bmd_fujitsu_read(bmd, 0x001476),
 
+		bmd_fujitsu_read(bmd, 0x001540),
 		bmd_fujitsu_read(bmd, 0x001542),
 		bmd_fujitsu_read(bmd, 0x001544),
 		bmd_fujitsu_read(bmd, 0x001546),
@@ -747,19 +958,28 @@ static void bmd_encoder_start(struct blackmagic_device *bmd)
 	uint8_t status;
 	int r;
 
-	if (bmd->current_display_mode == DMODE_invalid)
+	if (bmd->encode_sent || bmd->current_display_mode == DMODE_invalid)
 		return;
 
 	bmd->encode_sent = 1;
 
 	if (!bmd->current_mode) {
-		if (verbose >= 2)
+		if (loglevel >= LOG_DEBUG)
 			bmd_encoder_dump(bmd);
 		return;
 	}
 
-	if (verbose) fprintf(stderr, "%s: Configuring and starting encoder\n", bmd->name);
-	bmd_configure_encoder(bmd, &ep);
+	dlog(LOG_NOTICE, "%s: configuring and starting encoder", bmd->name);
+
+	if (!bmd_configure_encoder(bmd, &ep)) {
+		err = "configuring encoder";
+		goto error;
+	}
+
+	if (!bmd_start_exec_program(bmd, ep.exec_program)) {
+		err = "start exec program";
+		goto error;
+	}
 
 	r = libusb_control_transfer(
 		bmd->usbdev_handle, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR,
@@ -771,7 +991,7 @@ static void bmd_encoder_start(struct blackmagic_device *bmd)
 	}
 	return;
 error:
-	fprintf(stderr, "%s: failed to %s\n", bmd->name, err);
+	dlog(LOG_ERR, "%s: failed to %s", bmd->name, err);
 }
 
 static void bmd_encoder_stop(struct blackmagic_device *bmd)
@@ -783,6 +1003,9 @@ static void bmd_encoder_stop(struct blackmagic_device *bmd)
 	int i, r;
 
 	/* Stop recording */
+	dlog(LOG_NOTICE, "%s: stopping encoder", bmd->name);
+	bmd_kill_exec_program(bmd);
+
 	r = libusb_control_transfer(
 		bmd->usbdev_handle, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR,
 		VR_FUJITSU_STOP_ENCODING, 0, 0, &status, sizeof(status), 1000);
@@ -805,50 +1028,40 @@ static void bmd_encoder_stop(struct blackmagic_device *bmd)
 	}
 }
 
-static void bmd_parse_message(struct blackmagic_device *bmd, const uint8_t *msg)
+static void bmd_parse_message(struct blackmagic_device *bmd, const uint8_t *msg, int msg_len)
 {
 	int dm;
 
 	switch (msg[0]) {
 	case 0x01: /* Status update */
-		if (verbose) fprintf(stderr, "%s: FX2Status: %s (%d)\n", bmd->name, FX2Status_to_String(msg[5]), msg[5]);
+		dlog(LOG_DEBUG, "%s: FX2Status: %s (%d)", bmd->name, FX2Status_to_String(msg[5]), msg[5]);
 		bmd->fxstatus = msg[5];
-
-		if (bmd->fxstatus == FX2Status_Idle) {
-			bmd->encode_sent = 0;
-			if (!bmd->recognized)
-				bmd_recognize_device(bmd);
-			if (bmd->running && !bmd->encode_sent)
-				bmd_encoder_start(bmd);
-		} else if (bmd->fxstatus == FX2Status_Encoding) {
-			if (!bmd->encode_sent)
-				bmd_encoder_stop(bmd);
-		}
 		break;
 	case 0x05: /* Input connector */
 		dm = input_mode_to_display_mode(msg[1]);
-		bmd->current_display_mode = dm;
-		bmd->current_mode = display_modes[dm];
-
-		if (bmd->current_mode)
-			fprintf(stderr, "%s: Display Mode: %s\n", bmd->name, bmd->current_mode->description);
-		else
-			fprintf(stderr, "%s: Input Mode, 0x%02x (display mode 0x%02x) not supported\n", bmd->name, msg[1], dm);
-
-		if (dm == DMODE_invalid)
-			bmd->encode_sent = 0;
-		else if (bmd->running && bmd->fxstatus == FX2Status_Idle && !bmd->encode_sent)
-			bmd_encoder_start(bmd);
+		dlog(LOG_DEBUG, "%s: DisplayMode: %02x", bmd->name, dm);
+		if (dm != bmd->current_display_mode) {
+			bmd->current_display_mode = dm;
+			bmd->current_mode = display_modes[dm];
+			bmd->display_mode_changed = 1;
+		}
 		break;
 	case 0x0d:
-		fprintf(stderr, "%s: H56 Error. Restarting device.\n", bmd->name);
+		dlog(LOG_ERR, "%s: H56 error; restarting device", bmd->name);
 		break;
 	case 0x0e: /* Timestamp update? */
+		break;
+	default:
+		if (loglevel >= LOG_DEBUG) {
+			char tmp[512];
+			hexdump(tmp, sizeof(tmp), msg, msg_len);
+			dlog(LOG_DEBUG, "%s: unknown message %s", bmd->name, tmp);
+		}
 		break;
 	}
 }
 
-static void bmd_handle_messages(struct blackmagic_device *bmd)
+static void bmd_handle_messages(struct blackmagic_device *bmd, int force)
 {
 	int actual_length, r, i;
 
@@ -861,20 +1074,53 @@ static void bmd_handle_messages(struct blackmagic_device *bmd)
 			break;
 
 		/* The first 16-bits is the length of the full message */
-		if (verbose) {
-			fprintf(stderr, "%s: EP8: %4d bytes:", bmd->name, actual_length);
-			for (i = 0; i < actual_length; i++)
-				fprintf(stderr, " %02x", bmd->message_buffer[i]);
-			fprintf(stderr, "\n");
+		if (loglevel >= LOG_DEBUG) {
+			char tmp[512];
+			hexdump(tmp, sizeof(tmp), bmd->message_buffer, actual_length);
+			dlog(LOG_DEBUG, "%s: ep8: %4d bytes: %s", bmd->name, actual_length, tmp);
 		}
 
+		/* Parse queued messages, especially during boot/first connect
+		 * there can be lot of them, so process them allf irst. */
 		for (i = 2; bmd->message_buffer[i] != 0 && i < actual_length;
 		     i += bmd->message_buffer[i] + 1)
-			bmd_parse_message(bmd, &bmd->message_buffer[i+1]);
-	} while (running && bmd->running);
+			bmd_parse_message(bmd, &bmd->message_buffer[i+1], bmd->message_buffer[i]);
+
+		/* Act on status changes */
+		switch (bmd->fxstatus) {
+		case FX2Status_Idle:
+			bmd->encode_sent = 0;
+			if (!bmd->running)
+				break;
+
+			if (!bmd->recognized)
+				bmd_recognize_device(bmd);
+
+			if (bmd->current_mode)
+				dlog(LOG_NOTICE, "%s: display mode: %s", bmd->name, bmd->current_mode->description);
+			else if (bmd->current_display_mode == DMODE_invalid)
+				dlog(LOG_NOTICE, "%s: no signal", bmd->name);
+			else
+				dlog(LOG_ERR, "%s: display mode: 0x%02x; not supported", bmd->name, bmd->current_display_mode);
+
+			if (bmd->current_display_mode != DMODE_invalid)
+				bmd_encoder_start(bmd);
+			else if (bmd->display_mode_changed &&
+				 bmd->desc.idProduct == USB_PID_BMD_H264_PRO_RECORDER &&
+				 ep.input_source >= 0)
+				bmd_set_input_source(bmd, ep.input_source);
+			break;
+		case FX2Status_Encoding:
+			if (bmd->display_mode_changed || !bmd->encode_sent)
+				bmd_encoder_stop(bmd);
+			break;
+		}
+		bmd->display_mode_changed = 0;
+
+	} while ((force && bmd->fxstatus != FX2Status_Idle) || (running && bmd->running));
 
 	if (r != LIBUSB_SUCCESS) {
-		if (verbose) fprintf(stderr, "%s: message reader exiting: %s\n", bmd->name, libusb_error_name(r));
+		dlog(LOG_INFO, "%s: message reader exiting: %s", bmd->name, libusb_error_name(r));
 		bmd->status = r;
 	}
 }
@@ -886,6 +1132,7 @@ static void *bmd_device_thread(void *ctx)
 
 	bmd->running = 1;
 	bmd->current_display_mode = DMODE_invalid;
+	bmd->mpegparser.output_fd = -1;
 
 	/* Immediately after hotplug, the sysfs device nodes are not yet
 	 * available. Unfortunately, libusb_open will disconnect mark device
@@ -895,26 +1142,26 @@ static void *bmd_device_thread(void *ctx)
 
 	r = libusb_open(bmd->usbdev, &bmd->usbdev_handle);
 	if (r != LIBUSB_SUCCESS) {
-		fprintf(stderr, "%s: unable to open device: %s\n", bmd->name, libusb_error_name(r));
+		dlog(LOG_ERR, "%s: unable to open device: %s", bmd->name, libusb_error_name(r));
 		goto exit;
 	}
 
 	r = libusb_set_configuration(bmd->usbdev_handle, 1);
 	if (r != LIBUSB_SUCCESS) {
-		fprintf(stderr, "%s: failed to set configuration: %s\n", bmd->name, libusb_error_name(r));
+		dlog(LOG_ERR, "%s: failed to set configuration: %s", bmd->name, libusb_error_name(r));
 		goto exit;
 	}
 
 	r = libusb_claim_interface(bmd->usbdev_handle, 0);
 	if (r != LIBUSB_SUCCESS) {
-		fprintf(stderr, "%s: failed to claim interface: %s\n", bmd->name, libusb_error_name(r));
+		dlog(LOG_ERR, "%s: failed to claim interface: %s", bmd->name, libusb_error_name(r));
 		goto exit;
 	}
 
 	if (bmd->desc.iManufacturer == 0) {
 		const char *desc = "not available";
 
-		fprintf(stderr, "%s: firmware downloaded needed\n", bmd->name);
+		dlog(LOG_INFO, "%s: firmware downloaded needed", bmd->name);
 		for (i = 0; i < array_size(firmwares); i++) {
 			if (firmwares[i]->device_id != bmd->desc.idProduct)
 				continue;
@@ -924,15 +1171,11 @@ static void *bmd_device_thread(void *ctx)
 				desc = "failed to download";
 			break;
 		}
-		fprintf(stderr, "%s: firmware %s\n", bmd->name, desc);
+		dlog(LOG_NOTICE, "%s: firmware %s", bmd->name, desc);
 	} else {
 		if (bmd->desc.idProduct == USB_PID_BMD_H264_PRO_RECORDER &&
-		    ep.input_source >= 0) {
-			fprintf(stderr, "%s: Switching input source to %s (%d)\n",
-				bmd->name, input_source_names[ep.input_source],
-				ep.input_source);
+		    ep.input_source >= 0)
 			bmd_set_input_source(bmd, ep.input_source);
-		}
 
 		r = pthread_create(&bmd->mpegts_thread, NULL, bmd_pump_mpegts, bmd);
 		if (r < 0)
@@ -942,7 +1185,7 @@ static void *bmd_device_thread(void *ctx)
 			bmd->usbdev_handle, LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR,
 			VR_SEND_DEVICE_STATUS, 0, 0, 0, 0, 1000);
 		if (r == LIBUSB_SUCCESS)
-			bmd_handle_messages(bmd);
+			bmd_handle_messages(bmd, 0);
 
 		bmd->running = 0;
 		if (bmd->mpegts_thread)
@@ -951,12 +1194,13 @@ static void *bmd_device_thread(void *ctx)
 		if (bmd->fxstatus == FX2Status_Encoding && bmd->status == LIBUSB_SUCCESS) {
 			bmd_encoder_stop(bmd);
 			while (bmd->fxstatus != FX2Status_Idle && bmd->status == LIBUSB_SUCCESS)
-				bmd_handle_messages(bmd);
+				bmd_handle_messages(bmd, 1);
 		}
 	}
 
 exit:
-	fprintf(stderr, "%s: closing device\n", bmd->name);
+	dlog(LOG_INFO, "%s: closing device", bmd->name);
+	bmd_kill_exec_program(bmd);
 	libusb_close(bmd->usbdev_handle);
 	libusb_unref_device(bmd->usbdev);
 	free(bmd);
@@ -985,13 +1229,13 @@ static int handle_hotplug(libusb_context *ctx, libusb_device *dev, libusb_hotplu
 	bmd->usbdev = libusb_ref_device(dev);
 	bmd->status = LIBUSB_SUCCESS;
 
-	fprintf(stderr, "%s: device connected\n", bmd->name);
+	dlog(LOG_INFO, "%s: device connected", bmd->name);
 
 	__sync_add_and_fetch(&num_workers, 1);
 
 	r = pthread_create(&bmd->device_thread, NULL, bmd_device_thread, bmd);
 	if (r != 0) {
-		fprintf(stderr, "%s: failed to create handler thread\n", bmd->name);
+		dlog(LOG_ERR, "%s: failed to create handler thread", bmd->name);
 		libusb_unref_device(bmd->usbdev);
 		free(bmd);
 		return 0;
@@ -1010,14 +1254,19 @@ static int usage(void)
 		"	-k,--video-kbps		Set average video bitrate\n"
 		"	-K,--video-max-kbps	Set maximum video bitrate\n"
 		"	-a,--audio-kbps		Set audio bitrate\n"
-		"	-P,--h264-profile	Set H.264 profile (high,main,baseline)\n"
+		"	-P,--h264-profile	Set H.264 profile (high, main, baseline)\n"
 		"	-L,--h264-level		Set H.264 level (40 = level 4.0, etc..)\n"
 		"	-b,--h264-bframes	Allow using H.264 B-frames\n"
 		"	-B,--h264-no-bframes	Disable using H.264 B-frames\n"
 		"	-c,--h264-cabac		Allow using H.264 CABAC\n"
 		"	-C,--h264-no-cabac	Disable using H.264 CABAC\n"
-		"	-F,--fps-divider	Set framerate divider (input mode vs. encoded stream)\n"
-		"	-S,--input-source	Set input source: sdi/hdmi/composite (or 0-5).\n"
+		"	-F,--fps-divider	Set framerate divider (input / stream)\n"
+		"	-S,--input-source	Set input source (component, sdi, hdmi,\n"
+		"				composite, s-video, or 0-4)\n"
+		"	-f,--firmware-dir	Directory for firmare images\n"
+		"	-x,--exec		Program to execute for each connected stream\n"
+		"	-R,--respawn		Restart execute program if it exits\n"
+		"	-s,--syslog		Log to syslog\n"
 		"\n");
 	return 1;
 }
@@ -1044,29 +1293,38 @@ int main(int argc, char **argv)
 		{ "h264-cabac",		no_argument, NULL, 'c' },
 		{ "h264-no-cabac",	no_argument, NULL, 'C' },
 		{ "fps-divider",	required_argument, NULL, 'F' },
+		{ "firmware-dir",	required_argument, NULL, 'f' },
 		{ "input-source",	required_argument, NULL, 'S' },
+		{ "exec",		required_argument, NULL, 'x' },
+		{ "respawn",		no_argument, NULL, 'R' },
+		{ "syslog",		no_argument, NULL, 's' },
 		{ NULL }
 	};
-	static const char short_options[] = "vk:K:a:P:L:bcBCF:S:";
+	static const char short_options[] = "vk:K:a:P:L:bcBCF:f:S:x:Rs";
 
 	libusb_context *ctx;
 	libusb_hotplug_callback_handle cbhandle;
 	const char *msg = NULL;
 	int i, r, ec = 0, opt, optindex;
 
+	signal(SIGCHLD, reapchildren);
 	signal(SIGTERM, dostop);
 	signal(SIGINT, dostop);
+	signal(SIGPIPE, SIG_IGN);
 
 	optindex = 0;
 	while ((opt=getopt_long(argc, argv, short_options, long_options, &optindex)) > 0) {
 		switch (opt) {
+		case 's': do_syslog = 1; break;
+		case 'x': ep.exec_program = optarg; break;
+		case 'R': ep.respawn = 1; break;
 		case 'f':
 			if ((firmware_fd = open(optarg, O_DIRECTORY|O_RDONLY)) < 0) {
 				perror("open");
 				return usage();
 			}
 			break;
-		case 'v': verbose++; break;
+		case 'v': loglevel++; break;
 		case 'k': ep.video_kbps = atoi(optarg); break;
 		case 'K': ep.video_max_kbps = atoi(optarg); break;
 		case 'a': ep.audio_kbps = atoi(optarg); break;
@@ -1099,6 +1357,9 @@ int main(int argc, char **argv)
 	firmwares[0] = load_firmware("bmd-atemtvstudio.bin", USB_PID_BMD_ATEM_TV_STUDIO);
 	firmwares[1] = load_firmware("bmd-h264prorecorder.bin", USB_PID_BMD_H264_PRO_RECORDER);
 
+	if (do_syslog)
+		openlog("bmd-tools", 0, LOG_DAEMON);
+
 	r = libusb_init(&ctx);
 	if (r != LIBUSB_SUCCESS) {
 		msg = "initialize usb library", ec = 1;
@@ -1123,7 +1384,7 @@ int main(int argc, char **argv)
 
 error:
 	if (msg)
-		fprintf(stderr, "Failed to %s: %s\n", msg, libusb_error_name(r));
+		dlog(LOG_ERR, "failed to %s: %s", msg, libusb_error_name(r));
 	if (ctx)
 		libusb_exit(ctx);
 	return ec;
